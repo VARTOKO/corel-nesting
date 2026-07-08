@@ -1,0 +1,17 @@
+; Keeps export names undecorated so VBA `Declare ... Lib` can bind them.
+; Needed mainly for the x86 (Win32) build where __stdcall would otherwise
+; decorate names as _CN_Create@0 etc. For x64 the names are already clean,
+; but keeping the .def is harmless and documents the public surface.
+LIBRARY CorelNestingEngine
+EXPORTS
+    CN_Create
+    CN_Destroy
+    CN_Reset
+    CN_GetVersion
+    CN_SetSheet
+    CN_SetOptions
+    CN_AddPart
+    CN_Run
+    CN_GetPartCount
+    CN_GetResult
+    CN_GetUtilization
