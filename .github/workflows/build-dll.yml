@@ -1,0 +1,36 @@
+name: build-CorelNestingEngine-dll
+
+# يبني CorelNestingEngine.dll (64-بت) على خادم ويندوز حقيقي بمترجم MSVC،
+# ثم يتيحها للتنزيل كـ Artifact. لا تحتاج أي أداة على جهازك.
+#
+# Builds CorelNestingEngine.dll (x64) on a real Windows runner with MSVC
+# and publishes it as a downloadable artifact. No local tooling required.
+
+on:
+  workflow_dispatch:      # زر تشغيل يدوي من تبويب Actions
+  push:                   # يبني تلقائياً عند رفع الملفات
+
+jobs:
+  build-x64:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Configure (x64 / MSVC)
+        run: cmake -S . -B build -A x64
+        # لبناء نسخة 32-بت بدلاً من ذلك، استبدل السطر أعلاه بـ:
+        # run: cmake -S . -B build -A Win32
+
+      - name: Build (Release)
+        run: cmake --build build --config Release
+
+      - name: List output
+        run: dir build\Release
+
+      - name: Upload DLL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CorelNestingEngine-x64
+          path: build/Release/CorelNestingEngine.dll
+          if-no-files-found: error
