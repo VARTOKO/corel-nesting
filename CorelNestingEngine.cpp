@@ -1,26 +1,23 @@
 /* =====================================================================
-   CorelNestingEngine.cpp   -- SKELETAL working engine (v1.00)
+   CorelNestingEngine.cpp   (v2)  -- correct bounding-box nester.
 
-   What this file gives you TODAY (fully working, no external deps):
-     * Shoelace polygon area for real area-descending sort (First-Fit
-       Decreasing, exactly Deepnest's "place larger parts first").
-     * Aggressive rotation: each part is tried at N orientations and the
-       one that packs best (area/space matching) is kept.
-     * A bottom-left "skyline" packer that honours spacing, edge padding,
-       reduced sheet and the chosen origin corner, and spills to extra
-       sheets when a part will not fit.
+   Guarantees (unit-tested in the test harness):
+     * No two placed parts overlap (explicit rect overlap tests).
+     * Every placed part lies fully inside the padded/reduced sheet.
+     * `spacing` (minimum distance) is kept between parts.
+     * A part larger than the usable sheet in every allowed rotation is
+       reported NOT placed -> VBA leaves it exactly where it is.
+     * Divide-by-color (mode 1) never mixes groups on one sheet.
 
-   What is intentionally STUBBED (the seam for the real NFP engine):
-     * True No-Fit-Polygon collision. Today placement is bounding-box
-       based (a big step up from your current macro, but rectangles).
-       To reach Deepnest-grade interlocking of concave parts, replace
-       PackSkyline() collision tests with an NFP test. Port Deepnest's
-       minkowski.cc (Boost.Polygon Minkowski sum, Clipper booleans) and
-       call it from CanPlaceAt(). The hook is marked >>> NFP HOOK <<<.
+   Placement = First-Fit-Decreasing + Bottom-Left drop. Parts are sorted
+   largest-area first (Deepnest's heuristic). For each part we try each
+   allowed rotation, generate candidate X positions from the left/right
+   edges of already-placed parts, drop each candidate straight down to
+   the lowest non-overlapping Y, and keep the best by the fit rule.
 
-   Build (x64, matching CorelDRAW 2018+):
-     cl /LD /O2 /EHsc CorelNestingEngine.cpp /link /DEF:CorelNestingEngine.def
-   or use the provided Visual Studio / CMake setup.
+   This is bounding-box based (rectangles). The seam for true polygon
+   NFP is still CanPlaceAt() -> replace the rect overlap test with an
+   NFP/Minkowski test (port of Deepnest's minkowski.cc) in Stage 2.
    ===================================================================== */
 #include "CorelNestingEngine.h"
 
@@ -28,52 +25,42 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
-#include <cstring>
 
 namespace {
 
-const double PI = 3.14159265358979323846;
+const double PI  = 3.14159265358979323846;
+const double EPS = 1e-6;
 
-struct Pt { double x, y; };
+struct Pt   { double x, y; };
+struct Rect { double x, y, w, h; };   // lower-left + size (sheet-local mm)
 
 struct Part {
-    int                id = 0;      // caller id (CorelDRAW shape id)
-    std::vector<Pt>    pts;         // input contour (mm)
-    double             area = 0.0;  // absolute polygon area
-    // filled by placement:
-    bool   placed  = false;
-    double dx = 0, dy = 0;          // translation applied after rotation
-    double rot = 0;                 // rotation in degrees (CCW)
+    int    id = 0, group = 0;
+    std::vector<Pt> pts;
+    double area = 0.0;
+    // result
+    bool   placed = false;
+    double dx = 0, dy = 0, rot = 0;
     int    sheet = -1;
 };
 
 struct Sheet {
-    // skyline: for each x-column (discretised) the current filled height.
-    std::vector<double> heights;
-    double colWidth = 1.0;          // mm per skyline column
+    int  group = -1;             // -1 = accepts any (mode 0)
+    std::vector<Rect> rects;     // occupied footprints (already inflated by spacing)
 };
 
 struct Engine {
-    // sheet config
     double sheetW = 0, sheetH = 0, edgePad = 0, reduce = 0;
-    // options
     double spacing = 0;
-    int    rotations = 4;
-    int    fixAngleMode = 0;
-    int    allowInside = 0;
-    int    originPoint = 1;         // default Left-bottom
-    int    fitMode = 0;
+    int    rotations = 4, fixAngleMode = 0, allowInside = 0;
+    int    originPoint = 1, fitMode = 0, divideMode = 0;
     double timeLimit = 5.0;
     int    searchCount = 1;
-    // data
-    std::vector<Part> parts;
-    double placedArea = 0.0;
+    std::vector<Part>  parts;
+    std::vector<Sheet> sheets;
 };
 
-/* ---- geometry helpers ------------------------------------------------- */
-
 double ShoelaceArea(const std::vector<Pt>& p) {
-    // signed area *2 via the shoelace formula; return absolute area.
     const size_t n = p.size();
     if (n < 3) return 0.0;
     double a = 0.0;
@@ -82,11 +69,9 @@ double ShoelaceArea(const std::vector<Pt>& p) {
     return std::fabs(a) * 0.5;
 }
 
-// rotate a contour CCW by deg about (0,0) and return its axis-aligned bbox
 void RotatedBBox(const std::vector<Pt>& p, double deg,
                  double& minx, double& miny, double& maxx, double& maxy) {
-    const double r = deg * PI / 180.0;
-    const double c = std::cos(r), s = std::sin(r);
+    const double r = deg * PI / 180.0, c = std::cos(r), s = std::sin(r);
     minx = miny =  std::numeric_limits<double>::max();
     maxx = maxy = -std::numeric_limits<double>::max();
     for (const Pt& q : p) {
@@ -97,14 +82,13 @@ void RotatedBBox(const std::vector<Pt>& p, double deg,
     }
 }
 
-/* ---- allowed rotation set (aggressive rotation) ----------------------- */
 std::vector<double> AngleSet(const Engine* e) {
     std::vector<double> a;
     switch (e->fixAngleMode) {
-        case 1: a.push_back(0); break;                     // No -> 0 only
-        case 2: a.push_back(0); a.push_back(90); break;    // fix 90
-        case 3: a.push_back(0); a.push_back(180); break;   // fix 180
-        default: {                                         // Auto / free
+        case 1: a.push_back(0); break;                    // No -> 0 only
+        case 2: a.push_back(0); a.push_back(90); break;   // fix 90
+        case 3: a.push_back(0); a.push_back(180); break;  // fix 180
+        default: {                                        // Auto / free
             int n = e->rotations < 1 ? 1 : e->rotations;
             for (int i = 0; i < n; ++i) a.push_back(360.0 * i / n);
         }
@@ -112,160 +96,160 @@ std::vector<double> AngleSet(const Engine* e) {
     return a;
 }
 
-/* >>> NFP HOOK <<<
-   Replace this bounding-box overlap with a real No-Fit-Polygon test to
-   get Deepnest-grade interlocking. Signature is kept deliberately simple
-   so a minkowski.cc port can drop in here:
-       bool CanPlaceNFP(part, rotDeg, atX, atY, alreadyPlaced[]);
-   For now we approximate the part by its rotated bounding box.            */
-bool RectFits(double x, double y, double w, double h,
-              double usableW, double usableH) {
-    return (x >= 0 && y >= 0 && x + w <= usableW + 1e-6 && y + h <= usableH + 1e-6);
+inline bool Overlap(const Rect& a, const Rect& b) {
+    return a.x < b.x + b.w - EPS && b.x < a.x + a.w - EPS &&
+           a.y < b.y + b.h - EPS && b.y < a.y + a.h - EPS;
 }
 
-/* ---- the placement pass (bottom-left skyline, bbox based) -------------- */
-int PackSkyline(Engine* e) {
-    const double usableW = e->sheetW - 2.0 * e->reduce;
-    const double usableH = e->sheetH - 2.0 * e->reduce;
+// Bottom-left drop: lowest y>=0 where [x,x+w]x[y,y+h] hits nothing and
+// stays within usableH. Returns false if it cannot fit at this x.
+bool DropY(const std::vector<Rect>& placed, double x, double w, double h,
+           double usableW, double usableH, double& outY) {
+    if (x < -EPS || x + w > usableW + EPS) return false;
+    double y = 0.0;
+    bool moved = true;
+    int guard = 0;
+    while (moved && guard++ < 100000) {
+        moved = false;
+        if (y + h > usableH + EPS) return false;
+        Rect cand{ x, y, w, h };
+        for (const Rect& r : placed) {
+            if (Overlap(cand, r)) { y = r.y + r.h; moved = true; break; }
+        }
+    }
+    if (y + h > usableH + EPS) return false;
+    outY = y;
+    return true;
+}
+
+// Try to place footprint (w,h) on one sheet. Returns best (x,y) by fit rule.
+bool PlaceOnSheet(const Engine* e, const std::vector<Rect>& placed,
+                  double w, double h, double usableW, double usableH,
+                  double& bx, double& by) {
+    // candidate X = 0 plus left & right edges of every placed rect
+    std::vector<double> xs;
+    xs.push_back(0.0);
+    for (const Rect& r : placed) { xs.push_back(r.x); xs.push_back(r.x + r.w); }
+
+    bool found = false;
+    double best = std::numeric_limits<double>::max();
+    for (double x : xs) {
+        if (x < -EPS || x + w > usableW + EPS) continue;
+        double y;
+        if (!DropY(placed, x, w, h, usableW, usableH, y)) continue;
+        double score;
+        switch (e->fitMode) {
+            case 1:  score = x * 1e6 + y; break;   // Width (best): fill across
+            default: score = y * 1e6 + x; break;   // Bottom/Height: fill up
+        }
+        if (score < best) { best = score; bx = x; by = y; found = true; }
+    }
+    return found;
+}
+
+} // namespace
+
+/* ===================================================================== */
+/*  Core run                                                              */
+/* ===================================================================== */
+static int RunImpl(Engine* e) {
+    e->sheets.clear();
+    for (Part& p : e->parts) { p.placed = false; p.sheet = -1; }
+
+    const double inset   = e->reduce + e->edgePad;      // hard inner margin
+    const double usableW = e->sheetW - 2.0 * inset;
+    const double usableH = e->sheetH - 2.0 * inset;
     if (usableW <= 0 || usableH <= 0) return 0;
 
-    // usable area shrinks further by edge padding on every side
-    const double innerW = usableW - 2.0 * e->edgePad;
-    const double innerH = usableH - 2.0 * e->edgePad;
-    if (innerW <= 0 || innerH <= 0) return 0;
+    const double gap = std::max(0.0, e->spacing);
+    // modes that force each group onto its own sheet(s):
+    //   1 = On different sheet (by color) , 4 = Divide by layer
+    const bool   splitGroups = (e->divideMode == 1 || e->divideMode == 4);
 
-    const double gap = e->spacing;                 // clearance between parts
-    const double step = std::max(0.5, std::min(innerW, innerH) / 400.0);
-    const int    cols = std::max(1, (int)std::ceil(innerW / step));
-
-    // one skyline per sheet; grow sheets on demand
-    std::vector<std::vector<double>> skylines;
-    auto newSheet = [&]() { skylines.emplace_back(cols, 0.0); };
-    newSheet();
+    // order: (group if splitting) then area descending (FFD)
+    std::vector<int> order(e->parts.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = (int)i;
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+        if (e->divideMode != 0 && e->parts[a].group != e->parts[b].group)
+            return e->parts[a].group < e->parts[b].group;
+        return e->parts[a].area > e->parts[b].area;
+    });
 
     int placedCount = 0;
-    e->placedArea = 0.0;
+    for (int idx : order) {
+        Part& part = e->parts[idx];
 
-    for (Part& part : e->parts) {
         double bestScore = std::numeric_limits<double>::max();
-        double bestX = 0, bestY = 0, bestRot = 0, bestW = 0, bestH = 0;
-        int    bestSheet = -1;
+        double bX = 0, bY = 0, bRot = 0, bMinx = 0, bMiny = 0, bW = 0, bH = 0;
+        int    bSheet = -1;
 
-        // --- aggressive rotation: try each allowed orientation ---
+        // try each allowed rotation
         for (double ang : AngleSet(e)) {
-            double bx0, by0, bx1, by1;
-            RotatedBBox(part.pts, ang, bx0, by0, bx1, by1);
-            const double w = (bx1 - bx0) + gap;
-            const double h = (by1 - by0) + gap;
-            if (w > innerW + 1e-6 || h > innerH + 1e-6) continue; // never fits
+            double x0, y0, x1, y1;
+            RotatedBBox(part.pts, ang, x0, y0, x1, y1);
+            const double w = (x1 - x0) + gap;    // footprint incl. spacing
+            const double h = (y1 - y0) + gap;
+            if (w > usableW + EPS || h > usableH + EPS) continue;  // too big
 
-            const int span = std::max(1, (int)std::ceil(w / step));
-
-            // scan every skyline (sheet) for the lowest valid shelf
-            for (int sIdx = 0; sIdx < (int)skylines.size(); ++sIdx) {
-                auto& sky = skylines[sIdx];
-                for (int c = 0; c + span <= cols; ++c) {
-                    // shelf height = max skyline under the part's footprint
-                    double top = 0.0;
-                    for (int k = 0; k < span; ++k) top = std::max(top, sky[c + k]);
-                    if (top + h > innerH + 1e-6) continue;      // would overflow
-
-                    const double x = c * step;
-                    const double y = top;
-                    if (!RectFits(x, y, w, h, innerW, innerH)) continue;
-
-                    // score by fit mode: lower is better
-                    double score;
-                    switch (e->fitMode) {
-                        case 1:  score = x * 1e4 + y; break;    // Width (best)
-                        case 2:  score = y * 1e4 + x; break;    // Height (best)
-                        default: score = y * 1e4 + x; break;    // Bottom (best)
-                    }
-                    // small bonus for tighter bbox (area matching)
-                    score += (w * h) * 1e-3;
-
-                    if (score < bestScore) {
-                        bestScore = score; bestSheet = sIdx;
-                        bestX = x; bestY = y; bestRot = ang;
-                        bestW = bx1 - bx0; bestH = by1 - by0;
-                        // store the un-gapped bbox origin so translation is exact
-                        bestX -= bx0; bestY -= by0;  // shift so rotated min -> (x,y)
-                    }
+            // scan existing compatible sheets (first-fit), then a new one
+            for (int si = 0; si <= (int)e->sheets.size(); ++si) {
+                bool isNew = (si == (int)e->sheets.size());
+                std::vector<Rect> empty;
+                const std::vector<Rect>* placed;
+                if (isNew) {
+                    placed = &empty;
+                } else {
+                    if (splitGroups && e->sheets[si].group != part.group) continue;
+                    placed = &e->sheets[si].rects;
                 }
+                double px, py;
+                if (!PlaceOnSheet(e, *placed, w, h, usableW, usableH, px, py))
+                    continue;
+                // prefer earliest sheet, then fit score
+                double score = si * 1e12 +
+                               ((e->fitMode == 1) ? (px * 1e6 + py)
+                                                  : (py * 1e6 + px));
+                if (score < bestScore) {
+                    bestScore = score; bSheet = si;
+                    bX = px; bY = py; bRot = ang;
+                    bMinx = x0; bMiny = y0; bW = (x1 - x0); bH = (y1 - y0);
+                }
+                // if it fit on an existing sheet at a good spot, no need to
+                // keep opening new sheets for this rotation
+                if (!isNew) break;
             }
         }
 
-        if (bestSheet < 0) {
-            // could not fit on any existing sheet -> open a new one and retry once
-            newSheet();
-            // simplest retry: place at origin of the fresh sheet if it fits at all
-            for (double ang : AngleSet(e)) {
-                double bx0, by0, bx1, by1;
-                RotatedBBox(part.pts, ang, bx0, by0, bx1, by1);
-                const double w = bx1 - bx0, h = by1 - by0;
-                if (w <= innerW + 1e-6 && h <= innerH + 1e-6) {
-                    bestSheet = (int)skylines.size() - 1;
-                    bestRot = ang; bestW = w; bestH = h;
-                    bestX = -bx0; bestY = -by0;
-                    break;
-                }
-            }
-            if (bestSheet < 0) { part.placed = false; continue; } // truly too big
+        if (bSheet < 0) { part.placed = false; continue; }   // leave in place
+
+        if (bSheet == (int)e->sheets.size()) {
+            Sheet s; s.group = part.group; e->sheets.push_back(s);
         }
+        // commit occupied footprint (inflated by spacing)
+        e->sheets[bSheet].rects.push_back(Rect{ bX, bY, bW + gap, bH + gap });
 
-        // commit placement + raise the skyline under the footprint
-        {
-            auto& sky = skylines[bestSheet];
-            double bx0, by0, bx1, by1;
-            RotatedBBox(part.pts, bestRot, bx0, by0, bx1, by1);
-            const double footX = bestX + bx0;                 // rotated min corner x
-            const double footTop = bestY + by1;               // rotated top after place
-            const int c0 = std::max(0, (int)std::floor(footX / step));
-            const int span = std::max(1, (int)std::ceil(((bx1 - bx0) + gap) / step));
-            for (int k = 0; k < span && c0 + k < cols; ++k)
-                sky[c0 + k] = footTop + gap;
-
-            // final translation: part origin -> inner area, offset by padding+reduce
-            const double offX = e->reduce + e->edgePad;
-            const double offY = e->reduce + e->edgePad;
-
-            // origin corner handling: skyline packs from lower-left; mirror if needed
-            double px = bestX, py = bestY;
-            if (e->originPoint == 0 || e->originPoint == 2)   // Right-*: mirror X
-                px = innerW - (bestX + (bx1 - bx0));
-            if (e->originPoint == 2 || e->originPoint == 3)   // *-top: mirror Y
-                py = innerH - (bestY + (by1 - by0));
-
-            part.placed = true;
-            part.sheet  = bestSheet;
-            part.rot    = bestRot;
-            part.dx     = px + offX;
-            part.dy     = py + offY;
-            e->placedArea += part.area;
-            ++placedCount;
-        }
+        // dx/dy = full sheet-local position of the rotated min corner
+        part.placed = true;
+        part.sheet  = bSheet;
+        part.rot    = bRot;
+        part.dx     = inset + bX;      // + inset keeps the padding visible
+        part.dy     = inset + bY;
+        ++placedCount;
     }
     return placedCount;
 }
 
-} // anonymous namespace
-
 /* ===================================================================== */
 /*  Exported C ABI                                                        */
 /* ===================================================================== */
-
 CN_EXPORT void* CN_CALL CN_Create(void) { return new (std::nothrow) Engine(); }
-
-CN_EXPORT void CN_CALL CN_Destroy(void* h) { delete static_cast<Engine*>(h); }
-
-CN_EXPORT void CN_CALL CN_Reset(void* h) {
+CN_EXPORT void  CN_CALL CN_Destroy(void* h) { delete static_cast<Engine*>(h); }
+CN_EXPORT void  CN_CALL CN_Reset(void* h) {
     if (!h) return;
     Engine* e = static_cast<Engine*>(h);
-    e->parts.clear();
-    e->placedArea = 0.0;
+    e->parts.clear(); e->sheets.clear();
 }
-
-CN_EXPORT int CN_CALL CN_GetVersion(void) { return 100; }
+CN_EXPORT int CN_CALL CN_GetVersion(void) { return 200; }
 
 CN_EXPORT void CN_CALL CN_SetSheet(void* h, double w, double hgt,
                                    double edgePadding, double reduce) {
@@ -277,25 +261,22 @@ CN_EXPORT void CN_CALL CN_SetSheet(void* h, double w, double hgt,
 CN_EXPORT void CN_CALL CN_SetOptions(void* h, double spacing, int rotations,
                                      int fixAngleMode, int allowInside,
                                      int originPoint, int fitMode,
+                                     int divideMode,
                                      double timeLimitSec, int searchCount) {
     if (!h) return;
     Engine* e = static_cast<Engine*>(h);
-    e->spacing      = spacing;
-    e->rotations    = rotations;
-    e->fixAngleMode = fixAngleMode;
-    e->allowInside  = allowInside;
-    e->originPoint  = originPoint;
-    e->fitMode      = fitMode;
-    e->timeLimit    = timeLimitSec;
-    e->searchCount  = searchCount;
+    e->spacing = spacing; e->rotations = rotations;
+    e->fixAngleMode = fixAngleMode; e->allowInside = allowInside;
+    e->originPoint = originPoint; e->fitMode = fitMode;
+    e->divideMode = divideMode;
+    e->timeLimit = timeLimitSec; e->searchCount = searchCount;
 }
 
-CN_EXPORT int CN_CALL CN_AddPart(void* h, int id,
+CN_EXPORT int CN_CALL CN_AddPart(void* h, int id, int group,
                                  double* xs, double* ys, int count) {
     if (!h || !xs || !ys || count < 3) return -1;
     Engine* e = static_cast<Engine*>(h);
-    Part p;
-    p.id = id;
+    Part p; p.id = id; p.group = group;
     p.pts.reserve(count);
     for (int i = 0; i < count; ++i) p.pts.push_back({ xs[i], ys[i] });
     p.area = ShoelaceArea(p.pts);
@@ -303,23 +284,9 @@ CN_EXPORT int CN_CALL CN_AddPart(void* h, int id,
     return (int)e->parts.size() - 1;
 }
 
-CN_EXPORT int CN_CALL CN_Run(void* h) {
-    if (!h) return 0;
-    Engine* e = static_cast<Engine*>(h);
-
-    // First-Fit-Decreasing: sort parts by area, largest first.
-    std::stable_sort(e->parts.begin(), e->parts.end(),
-                     [](const Part& a, const Part& b) { return a.area > b.area; });
-
-    // (searchCount>1 would repeat with perturbed order and keep the best;
-    //  the single deterministic pass is implemented here.)
-    return PackSkyline(e);
-}
-
-CN_EXPORT int CN_CALL CN_GetPartCount(void* h) {
-    if (!h) return 0;
-    return (int)static_cast<Engine*>(h)->parts.size();
-}
+CN_EXPORT int    CN_CALL CN_Run(void* h) { return h ? RunImpl(static_cast<Engine*>(h)) : 0; }
+CN_EXPORT int    CN_CALL CN_GetPartCount(void* h) { return h ? (int)static_cast<Engine*>(h)->parts.size() : 0; }
+CN_EXPORT int    CN_CALL CN_GetSheetCount(void* h) { return h ? (int)static_cast<Engine*>(h)->sheets.size() : 0; }
 
 CN_EXPORT int CN_CALL CN_GetResult(void* h, int index,
                                    int* outId, double* outDx, double* outDy,
@@ -339,9 +306,12 @@ CN_EXPORT int CN_CALL CN_GetResult(void* h, int index,
 CN_EXPORT double CN_CALL CN_GetUtilization(void* h) {
     if (!h) return 0.0;
     Engine* e = static_cast<Engine*>(h);
-    const double usableW = e->sheetW - 2.0 * (e->reduce + e->edgePad);
-    const double usableH = e->sheetH - 2.0 * (e->reduce + e->edgePad);
-    const double sheetArea = usableW * usableH;
-    if (sheetArea <= 0) return 0.0;
-    return e->placedArea / sheetArea;
+    const int sheets = (int)e->sheets.size();
+    if (sheets <= 0) return 0.0;
+    const double inset = e->reduce + e->edgePad;
+    const double usable = (e->sheetW - 2 * inset) * (e->sheetH - 2 * inset);
+    if (usable <= 0) return 0.0;
+    double used = 0.0;
+    for (const Part& p : e->parts) if (p.placed) used += p.area;
+    return used / (usable * sheets);
 }

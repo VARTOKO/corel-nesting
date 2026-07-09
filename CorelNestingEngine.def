@@ -13,5 +13,6 @@ EXPORTS
     CN_AddPart
     CN_Run
     CN_GetPartCount
+    CN_GetSheetCount
     CN_GetResult
     CN_GetUtilization
