@@ -1,42 +1,49 @@
 /* =====================================================================
-   CorelNestingEngine.cpp   (v2)  -- correct bounding-box nester.
+   CorelNestingEngine.cpp   (v3)  -- TRUE No-Fit-Polygon nester.
 
-   Guarantees (unit-tested in the test harness):
-     * No two placed parts overlap (explicit rect overlap tests).
-     * Every placed part lies fully inside the padded/reduced sheet.
-     * `spacing` (minimum distance) is kept between parts.
-     * A part larger than the usable sheet in every allowed rotation is
-       reported NOT placed -> VBA leaves it exactly where it is.
-     * Divide-by-color (mode 1) never mixes groups on one sheet.
+   Stage 2: real polygon interlocking (not bounding boxes), using the
+   same No-Fit-Polygon (NFP) idea as Deepnest, but built on Clipper2:
 
-   Placement = First-Fit-Decreasing + Bottom-Left drop. Parts are sorted
-   largest-area first (Deepnest's heuristic). For each part we try each
-   allowed rotation, generate candidate X positions from the left/right
-   edges of already-placed parts, drop each candidate straight down to
-   the lowest non-overlapping Y, and keep the best by the fit rule.
+     NFP(A,B)  = the set of translations t of part B for which (B+t)
+                 touches/penetrates fixed part A.  Computed directly as
+                 MinkowskiDiff(B, A) = A (+) (-B)   [Clipper2].
+     IFP       = inner-fit rectangle: translations of B that keep it
+                 inside the usable sheet (sheet minus reduce+edgePadding).
+     feasible  = IFP  -  Union( NFP(placed_i, B) inflated by `spacing` )
+     place B   = the vertex of `feasible` chosen by the fit/origin rule
+                 (bottom-left / gravity). Vertices on the NFP boundary
+                 are exact touching positions -> tight, non-overlapping
+                 nesting that also fills concavities.
 
-   This is bounding-box based (rectangles). The seam for true polygon
-   NFP is still CanPlaceAt() -> replace the rect overlap test with an
-   NFP/Minkowski test (port of Deepnest's minkowski.cc) in Stage 2.
+   Verified in the test harness: zero overlap, concave parts interlock,
+   oversized parts are left unplaced, divide-by-color never mixes groups.
+
+   Requires Clipper2 (bundled via CMake FetchContent). Falls back to the
+   v2 bounding-box engine only if you build that file instead.
+
+   The part contour fed from VBA should be the REAL outline (flattened
+   Shape.DisplayCurve), not the bounding box -- see modNestBridge v3.
    ===================================================================== */
 #include "CorelNestingEngine.h"
+#include "clipper2/clipper.h"
 
 #include <vector>
 #include <algorithm>
 #include <cmath>
 #include <limits>
 
+using namespace Clipper2Lib;
+
 namespace {
 
-const double PI  = 3.14159265358979323846;
-const double EPS = 1e-6;
+const double PI = 3.14159265358979323846;
+const double SC = 1000.0;                 // mm -> integer (micron precision)
 
-struct Pt   { double x, y; };
-struct Rect { double x, y, w, h; };   // lower-left + size (sheet-local mm)
+struct Pt { double x, y; };
 
 struct Part {
-    int    id = 0, group = 0;
-    std::vector<Pt> pts;
+    int id = 0, group = 0;
+    std::vector<Pt> pts;                  // real outline, mm (local coords)
     double area = 0.0;
     // result
     bool   placed = false;
@@ -45,8 +52,8 @@ struct Part {
 };
 
 struct Sheet {
-    int  group = -1;             // -1 = accepts any (mode 0)
-    std::vector<Rect> rects;     // occupied footprints (already inflated by spacing)
+    int group = -1;
+    Paths64 placed;                       // absolute placed polygons (scaled)
 };
 
 struct Engine {
@@ -69,26 +76,43 @@ double ShoelaceArea(const std::vector<Pt>& p) {
     return std::fabs(a) * 0.5;
 }
 
-void RotatedBBox(const std::vector<Pt>& p, double deg,
-                 double& minx, double& miny, double& maxx, double& maxy) {
+// rotate contour CCW by deg, scale to int, return a positively-oriented path
+Path64 ToPath(const std::vector<Pt>& pts, double deg) {
     const double r = deg * PI / 180.0, c = std::cos(r), s = std::sin(r);
-    minx = miny =  std::numeric_limits<double>::max();
-    maxx = maxy = -std::numeric_limits<double>::max();
-    for (const Pt& q : p) {
+    std::vector<int64_t> v; v.reserve(pts.size() * 2);
+    for (const Pt& q : pts) {
         const double rx = q.x * c - q.y * s;
         const double ry = q.x * s + q.y * c;
-        minx = std::min(minx, rx); maxx = std::max(maxx, rx);
-        miny = std::min(miny, ry); maxy = std::max(maxy, ry);
+        v.push_back((int64_t)std::llround(rx * SC));
+        v.push_back((int64_t)std::llround(ry * SC));
     }
+    Path64 p = MakePath(v);
+    if (Area(p) < 0) std::reverse(p.begin(), p.end());   // ensure CCW/positive
+    return p;
+}
+
+void BBox(const Path64& p, int64_t& mnx, int64_t& mny, int64_t& mxx, int64_t& mxy) {
+    mnx = mny = std::numeric_limits<int64_t>::max();
+    mxx = mxy = std::numeric_limits<int64_t>::min();
+    for (const Point64& q : p) {
+        if (q.x < mnx) mnx = q.x; if (q.y < mny) mny = q.y;
+        if (q.x > mxx) mxx = q.x; if (q.y > mxy) mxy = q.y;
+    }
+}
+
+Path64 Translate(const Path64& p, int64_t dx, int64_t dy) {
+    Path64 r; r.reserve(p.size());
+    for (const Point64& q : p) r.push_back(Point64(int64_t(q.x + dx), int64_t(q.y + dy)));
+    return r;
 }
 
 std::vector<double> AngleSet(const Engine* e) {
     std::vector<double> a;
     switch (e->fixAngleMode) {
-        case 1: a.push_back(0); break;                    // No -> 0 only
-        case 2: a.push_back(0); a.push_back(90); break;   // fix 90
-        case 3: a.push_back(0); a.push_back(180); break;  // fix 180
-        default: {                                        // Auto / free
+        case 1: a.push_back(0); break;
+        case 2: a.push_back(0); a.push_back(90); break;
+        case 3: a.push_back(0); a.push_back(180); break;
+        default: {
             int n = e->rotations < 1 ? 1 : e->rotations;
             for (int i = 0; i < n; ++i) a.push_back(360.0 * i / n);
         }
@@ -96,77 +120,25 @@ std::vector<double> AngleSet(const Engine* e) {
     return a;
 }
 
-inline bool Overlap(const Rect& a, const Rect& b) {
-    return a.x < b.x + b.w - EPS && b.x < a.x + a.w - EPS &&
-           a.y < b.y + b.h - EPS && b.y < a.y + a.h - EPS;
-}
-
-// Bottom-left drop: lowest y>=0 where [x,x+w]x[y,y+h] hits nothing and
-// stays within usableH. Returns false if it cannot fit at this x.
-bool DropY(const std::vector<Rect>& placed, double x, double w, double h,
-           double usableW, double usableH, double& outY) {
-    if (x < -EPS || x + w > usableW + EPS) return false;
-    double y = 0.0;
-    bool moved = true;
-    int guard = 0;
-    while (moved && guard++ < 100000) {
-        moved = false;
-        if (y + h > usableH + EPS) return false;
-        Rect cand{ x, y, w, h };
-        for (const Rect& r : placed) {
-            if (Overlap(cand, r)) { y = r.y + r.h; moved = true; break; }
-        }
-    }
-    if (y + h > usableH + EPS) return false;
-    outY = y;
-    return true;
-}
-
-// Try to place footprint (w,h) on one sheet. Returns best (x,y) by fit rule.
-bool PlaceOnSheet(const Engine* e, const std::vector<Rect>& placed,
-                  double w, double h, double usableW, double usableH,
-                  double& bx, double& by) {
-    // candidate X = 0 plus left & right edges of every placed rect
-    std::vector<double> xs;
-    xs.push_back(0.0);
-    for (const Rect& r : placed) { xs.push_back(r.x); xs.push_back(r.x + r.w); }
-
-    bool found = false;
-    double best = std::numeric_limits<double>::max();
-    for (double x : xs) {
-        if (x < -EPS || x + w > usableW + EPS) continue;
-        double y;
-        if (!DropY(placed, x, w, h, usableW, usableH, y)) continue;
-        double score;
-        switch (e->fitMode) {
-            case 1:  score = x * 1e6 + y; break;   // Width (best): fill across
-            default: score = y * 1e6 + x; break;   // Bottom/Height: fill up
-        }
-        if (score < best) { best = score; bx = x; by = y; found = true; }
-    }
-    return found;
-}
-
 } // namespace
 
-/* ===================================================================== */
-/*  Core run                                                              */
 /* ===================================================================== */
 static int RunImpl(Engine* e) {
     e->sheets.clear();
     for (Part& p : e->parts) { p.placed = false; p.sheet = -1; }
 
-    const double inset   = e->reduce + e->edgePad;      // hard inner margin
-    const double usableW = e->sheetW - 2.0 * inset;
-    const double usableH = e->sheetH - 2.0 * inset;
-    if (usableW <= 0 || usableH <= 0) return 0;
+    const double insetMM = e->reduce + e->edgePad;
+    const int64_t Wi = (int64_t)std::llround((e->sheetW - 2 * insetMM) * SC);
+    const int64_t Hi = (int64_t)std::llround((e->sheetH - 2 * insetMM) * SC);
+    if (Wi <= 0 || Hi <= 0) return 0;
 
-    const double gap = std::max(0.0, e->spacing);
-    // modes that force each group onto its own sheet(s):
-    //   1 = On different sheet (by color) , 4 = Divide by layer
-    const bool   splitGroups = (e->divideMode == 1 || e->divideMode == 4);
+    const int64_t spaceI = (int64_t)std::llround(std::max(0.0, e->spacing) * SC);
+    const bool splitGroups = (e->divideMode == 1 || e->divideMode == 4);
+    const bool allowInside = (e->allowInside != 0);
+    const bool originRight = (e->originPoint == 0 || e->originPoint == 2);
+    const bool originTop   = (e->originPoint == 2 || e->originPoint == 3);
 
-    // order: (group if splitting) then area descending (FFD)
+    // FFD order (+ group clustering when dividing)
     std::vector<int> order(e->parts.size());
     for (size_t i = 0; i < order.size(); ++i) order[i] = (int)i;
     std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
@@ -180,43 +152,94 @@ static int RunImpl(Engine* e) {
         Part& part = e->parts[idx];
 
         double bestScore = std::numeric_limits<double>::max();
-        double bX = 0, bY = 0, bRot = 0, bMinx = 0, bMiny = 0, bW = 0, bH = 0;
-        int    bSheet = -1;
+        int64_t bTx = 0, bTy = 0, bMnx = 0, bMny = 0;
+        double  bRot = 0;
+        int     bSheet = -1;
+        Path64  bPath;
 
-        // try each allowed rotation
         for (double ang : AngleSet(e)) {
-            double x0, y0, x1, y1;
-            RotatedBBox(part.pts, ang, x0, y0, x1, y1);
-            const double w = (x1 - x0) + gap;    // footprint incl. spacing
-            const double h = (y1 - y0) + gap;
-            if (w > usableW + EPS || h > usableH + EPS) continue;  // too big
+            Path64 B = ToPath(part.pts, ang);
+            int64_t mnx, mny, mxx, mxy; BBox(B, mnx, mny, mxx, mxy);
+            const int64_t w = mxx - mnx, h = mxy - mny;
+            if (w > Wi || h > Hi) continue;                 // too big for sheet
 
-            // scan existing compatible sheets (first-fit), then a new one
+            // IFP: allowed translation t of B so that B+t is in [0,Wi]x[0,Hi]
+            std::vector<int64_t> iv = {
+                -mnx, -mny,  Wi - mxx, -mny,  Wi - mxx, Hi - mxy,  -mnx, Hi - mxy };
+            Paths64 ifp = { MakePath(iv) };
+
             for (int si = 0; si <= (int)e->sheets.size(); ++si) {
-                bool isNew = (si == (int)e->sheets.size());
-                std::vector<Rect> empty;
-                const std::vector<Rect>* placed;
-                if (isNew) {
-                    placed = &empty;
+                const bool isNew = (si == (int)e->sheets.size());
+                if (!isNew && splitGroups && e->sheets[si].group != part.group) continue;
+
+                // forbidden region (union of NFPs vs placed, grown by spacing)
+                Paths64 feasible;
+                if (isNew || e->sheets[si].placed.empty()) {
+                    feasible = ifp;
                 } else {
-                    if (splitGroups && e->sheets[si].group != part.group) continue;
-                    placed = &e->sheets[si].rects;
+                    Paths64 nfp;
+                    for (const Path64& P : e->sheets[si].placed) {
+                        // MinkowskiDiff can emit tiny reverse-oriented slivers
+                        // that would punch false holes under a winding union.
+                        // Force every sub-path positive before combining.
+                        Paths64 mk = MinkowskiDiff(B, P, true);   // P (+) (-B)
+                        for (auto& pp : mk) {
+                            if (pp.size() < 3) continue;
+                            if (Area(pp) < 0) std::reverse(pp.begin(), pp.end());
+                            nfp.push_back(pp);
+                        }
+                    }
+                    Paths64 forbid = Union(nfp, FillRule::NonZero);
+                    if (spaceI > 0 && !forbid.empty())
+                        forbid = InflatePaths(forbid, (double)spaceI,
+                                              JoinType::Round, EndType::Polygon);
+                    feasible = Difference(ifp, forbid, FillRule::NonZero);
                 }
-                double px, py;
-                if (!PlaceOnSheet(e, *placed, w, h, usableW, usableH, px, py))
-                    continue;
-                // prefer earliest sheet, then fit score
-                double score = si * 1e12 +
-                               ((e->fitMode == 1) ? (px * 1e6 + py)
-                                                  : (py * 1e6 + px));
+                if (feasible.empty()) continue;
+
+                // bounding box of what is already on this sheet
+                int64_t pmnx = 0, pmny = 0, pmxx = 0, pmxy = 0; bool hasPlaced = false;
+                if (!isNew) {
+                    for (const Path64& P : e->sheets[si].placed) {
+                        int64_t a, b, c, d; BBox(P, a, b, c, d);
+                        if (!hasPlaced) { pmnx = a; pmny = b; pmxx = c; pmxy = d; hasPlaced = true; }
+                        else { pmnx = std::min(pmnx, a); pmny = std::min(pmny, b);
+                               pmxx = std::max(pmxx, c); pmxy = std::max(pmxy, d); }
+                    }
+                }
+
+                // choose the candidate that keeps the whole layout smallest in
+                // the fit direction (this fills concavities instead of growing
+                // the pile), with a gravity tiebreak toward the origin corner.
+                bool localFound = false; int64_t tx = 0, ty = 0;
+                double localBest = std::numeric_limits<double>::max();
+                for (const Path64& poly : feasible) {
+                    if (Area(poly) < 0 && !allowInside) continue;  // skip pockets
+                    for (const Point64& v : poly) {
+                        const int64_t bx0 = mnx + v.x, by0 = mny + v.y;
+                        const int64_t bx1 = mxx + v.x, by1 = mxy + v.y;
+                        const int64_t cmnx = hasPlaced ? std::min(pmnx, bx0) : bx0;
+                        const int64_t cmny = hasPlaced ? std::min(pmny, by0) : by0;
+                        const int64_t cmxx = hasPlaced ? std::max(pmxx, bx1) : bx1;
+                        const int64_t cmxy = hasPlaced ? std::max(pmxy, by1) : by1;
+                        const double cW = (cmxx - cmnx) / SC;
+                        const double cH = (cmxy - cmny) / SC;
+                        const double prim = (e->fitMode == 1) ? cW : cH;
+                        const double gy = (originTop  ? -(double)by1 : (double)by0) / SC;
+                        const double gx = (originRight ? -(double)bx1 : (double)bx0) / SC;
+                        const double sc = prim * 1e12 + (cW * cH) * 1e3 + gy * 10.0 + gx;
+                        if (sc < localBest) { localBest = sc; tx = v.x; ty = v.y; localFound = true; }
+                    }
+                }
+                if (!localFound) continue;
+
+                const double score = si * 1e18 + localBest;
                 if (score < bestScore) {
-                    bestScore = score; bSheet = si;
-                    bX = px; bY = py; bRot = ang;
-                    bMinx = x0; bMiny = y0; bW = (x1 - x0); bH = (y1 - y0);
+                    bestScore = score; bSheet = si; bRot = ang;
+                    bTx = tx; bTy = ty; bMnx = mnx; bMny = mny;
+                    bPath = Translate(B, tx, ty);
                 }
-                // if it fit on an existing sheet at a good spot, no need to
-                // keep opening new sheets for this rotation
-                if (!isNew) break;
+                if (!isNew) break;              // first-fit: stop at earliest sheet
             }
         }
 
@@ -225,22 +248,20 @@ static int RunImpl(Engine* e) {
         if (bSheet == (int)e->sheets.size()) {
             Sheet s; s.group = part.group; e->sheets.push_back(s);
         }
-        // commit occupied footprint (inflated by spacing)
-        e->sheets[bSheet].rects.push_back(Rect{ bX, bY, bW + gap, bH + gap });
+        e->sheets[bSheet].placed.push_back(bPath);
 
-        // dx/dy = full sheet-local position of the rotated min corner
         part.placed = true;
         part.sheet  = bSheet;
         part.rot    = bRot;
-        part.dx     = inset + bX;      // + inset keeps the padding visible
-        part.dy     = inset + bY;
+        part.dx     = insetMM + (double)(bMnx + bTx) / SC;   // min-corner, full sheet
+        part.dy     = insetMM + (double)(bMny + bTy) / SC;
         ++placedCount;
     }
     return placedCount;
 }
 
 /* ===================================================================== */
-/*  Exported C ABI                                                        */
+/*  Exported C ABI (unchanged from v2)                                    */
 /* ===================================================================== */
 CN_EXPORT void* CN_CALL CN_Create(void) { return new (std::nothrow) Engine(); }
 CN_EXPORT void  CN_CALL CN_Destroy(void* h) { delete static_cast<Engine*>(h); }
@@ -249,7 +270,7 @@ CN_EXPORT void  CN_CALL CN_Reset(void* h) {
     Engine* e = static_cast<Engine*>(h);
     e->parts.clear(); e->sheets.clear();
 }
-CN_EXPORT int CN_CALL CN_GetVersion(void) { return 200; }
+CN_EXPORT int CN_CALL CN_GetVersion(void) { return 300; }
 
 CN_EXPORT void CN_CALL CN_SetSheet(void* h, double w, double hgt,
                                    double edgePadding, double reduce) {

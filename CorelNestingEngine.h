@@ -1,5 +1,5 @@
 /* =====================================================================
-   CorelNestingEngine.h   (v2)
+   CorelNestingEngine.h   (v3 - NFP; ABI identical to v2)
    High-performance nesting engine for CorelDRAW (called from VBA).
 
    ABI: plain C exports (extern "C") + .def so VBA `Declare` binds by name.
