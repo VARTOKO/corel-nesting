@@ -1,5 +1,5 @@
 /* =====================================================================
-   CorelNestingEngine.h   (v3 - NFP; ABI identical to v2)
+   CorelNestingEngine.h   (v2)
    High-performance nesting engine for CorelDRAW (called from VBA).
 
    ABI: plain C exports (extern "C") + .def so VBA `Declare` binds by name.
@@ -14,6 +14,14 @@
      * dx/dy are returned in FULL sheet-local mm (0..sheetW, 0..sheetH),
        i.e. the inner padding offset is already applied.
      * CN_GetSheetCount reports how many sheets the layout used.
+
+   v2.1 changes vs v2 (ABI UNCHANGED -- same signatures, just rebuild):
+     * fitMode 2 (Height best) now fills the sheet height first (minimal
+       used width); 0 (Bottom) / 1 (Width) fill bottom rows first.
+     * spacing is enforced BETWEEN parts only, never against the sheet
+       edge -- an exact-fit part is no longer rejected because of it.
+       (Edge distance stays reduce + edgePadding.)
+     * CN_GetVersion returns 210 so VBA can detect a stale DLL.
    ===================================================================== */
 #ifndef COREL_NESTING_ENGINE_H
 #define COREL_NESTING_ENGINE_H
@@ -34,7 +42,7 @@ extern "C" {
 CN_EXPORT void*  CN_CALL CN_Create(void);
 CN_EXPORT void   CN_CALL CN_Destroy(void* h);
 CN_EXPORT void   CN_CALL CN_Reset(void* h);
-CN_EXPORT int    CN_CALL CN_GetVersion(void);      /* 200 = 2.00 */
+CN_EXPORT int    CN_CALL CN_GetVersion(void);      /* 210 = 2.10 */
 
 /* ---- configuration ---------------------------------------------------- */
 CN_EXPORT void   CN_CALL CN_SetSheet(void* h,
